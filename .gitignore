@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment & secrets
+.env
+
+# Logs & data (runtime generated)
+logs/*.db
+logs/*.csv
+logs/*.json
+logs/*.log
+logs/cache/
+logs/daily/
+logs/weekly/
+!logs/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Swap files
+swapfile
