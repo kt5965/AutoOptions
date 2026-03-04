@@ -21,7 +21,7 @@ class RiskConfig:
     per_stock_loss_pct: float = 0.01          # 개별 종목 손실 1% (보수적)
     daily_loss_pct: float = 0.03              # 일일 손실 3%
     max_position_pct: float = 0.15            # 종목당 최대 비중 15%
-    max_positions: int = 5                    # 최대 동시 보유 종목 수
+    max_positions: int = 4                    # 최대 동시 보유 종목 수
 
 
 @dataclass
@@ -34,11 +34,11 @@ class FeeConfig:
 
 @dataclass
 class StrategyConfig:
-    # 모멘텀 브레이크아웃 (파라미터는 strategy/momentum.py에 직접 정의)
-    momentum_lookback: int = 40               # 20일 고가 돌파
-    momentum_volume_mult: float = 2         # 거래량 2배 이상
+    # 모멘텀 브레이크아웃 (최적화된 파라미터, 2021-2026 백테스트 기반)
+    momentum_lookback: int = 60               # 60일 고가 돌파
+    momentum_volume_mult: float = 1.3         # 거래량 1.3배 이상
     momentum_atr_period: int = 14
-    momentum_atr_mult: float = 3.0            # ATR 2배 손절
+    momentum_atr_mult: float = 3.0            # ATR 3배 손절
 
     # 평균회귀
     mean_rev_bb_period: int = 20              # 볼린저밴드 기간

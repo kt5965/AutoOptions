@@ -7,8 +7,12 @@
   - MA5 > MA20 (단기 추세 상승)
 
 청산 조건:
-  - 손절: 진입가 -5% 또는 ATR*2 이탈 중 좁은 것
-  - 트레일링 스탑: 보유 중 고점 대비 2.5 ATR 이탈
+  - 손절: 진입가 -10% 또는 ATR*3 이탈 중 좁은 것
+  - 구간별 트레일링 스탑:
+    +30% 이상 → 고점 - 1.5 ATR (타이트, 큰 수익 보존)
+    +20~30%   → 고점 - 2.0 ATR
+    +10~20%   → 고점 - 2.5 ATR
+    0~10%     → 고점 - 3.0 ATR (느슨, 추세 유지)
   - 시간 청산: 15거래일 보유 후 강제 청산
   - 일일 손실 5만원 도달 시 전체 청산
 
@@ -51,6 +55,23 @@ class MomentumPosition:
     holding_days: int = 0
     atr_at_entry: float = 0  # 진입 시점 ATR
 
+    # 구간별 트레일링 ATR 배수 (수익률 구간 → ATR 배수)
+    # 수익이 클수록 타이트하게 → 수익 보존
+    TRAILING_TIERS = [
+        (0.30, 1.5),   # +30% 이상: 고점 - 1.5 ATR (타이트, 큰 수익 보존)
+        (0.20, 2.0),   # +20~30%:   고점 - 2.0 ATR
+        (0.10, 2.5),   # +10~20%:   고점 - 2.5 ATR
+        (0.00, 3.0),   # 0~10%:     고점 - 3.0 ATR (느슨, 추세 유지)
+    ]
+
+    def _get_trailing_mult(self) -> float:
+        """현재 수익률 구간에 맞는 트레일링 ATR 배수 리턴"""
+        pnl_pct = (self.highest_since_entry - self.entry_price) / self.entry_price
+        for threshold, mult in self.TRAILING_TIERS:
+            if pnl_pct >= threshold:
+                return mult
+        return 3.0
+
     def update(self, current_high: float, current_atr: float) -> str:
         """매일 호출: 트레일링 스탑 갱신, 보유일 증가. 청산 사유 리턴 (없으면 빈 문자열)"""
         self.holding_days += 1
@@ -58,10 +79,12 @@ class MomentumPosition:
         # 고점 갱신
         if current_high > self.highest_since_entry:
             self.highest_since_entry = current_high
-            # 트레일링 스탑: 고점 대비 2.5 ATR
-            new_trail = self.highest_since_entry - 2.5 * current_atr
-            if new_trail > self.trailing_stop:
-                self.trailing_stop = new_trail
+
+        # 구간별 트레일링: 수익률에 따라 ATR 배수 조정
+        trail_mult = self._get_trailing_mult()
+        new_trail = self.highest_since_entry - trail_mult * current_atr
+        if new_trail > self.trailing_stop:
+            self.trailing_stop = new_trail
 
         return ""
 
@@ -75,7 +98,8 @@ class MomentumPosition:
         # 2) 트레일링 스탑
         if current_price <= self.trailing_stop:
             drop = (self.highest_since_entry - current_price) / self.highest_since_entry * 100
-            return f"트레일링스탑 (고점 {self.highest_since_entry:,.0f} 대비 -{drop:.1f}%)"
+            trail_mult = self._get_trailing_mult()
+            return f"트레일링스탑 (고점 {self.highest_since_entry:,.0f} 대비 -{drop:.1f}%, {trail_mult:.1f}ATR)"
 
         # 3) 시간 청산: 15거래일
         if self.holding_days >= 15:
@@ -88,18 +112,18 @@ class MomentumPosition:
 class MomentumBreakout:
     """모멘텀 브레이크아웃 전략"""
 
-    # ─── 기본값 (config로 오버라이드 가능) ────────
-    LOOKBACK = 40              # 40일 고가 돌파
-    ADX_THRESHOLD = 20         # ADX > 20
-    VOLUME_MULT = 2.0          # 거래량 2배
-    STOP_PCT = 0.05            # 진입가 -5%
+    # ─── 최적화된 파라미터 (2021-2026 백테스트 기반) ────────
+    LOOKBACK = 60              # 60일 고가 돌파
+    ADX_THRESHOLD = 30         # ADX > 30 (강한 추세만)
+    VOLUME_MULT = 1.3          # 거래량 1.3배
+    STOP_PCT = 0.10            # 진입가 -10%
     ATR_STOP_MULT = 3.0        # ATR 3배 손절
-    TRAILING_ATR_MULT = 2.5    # 트레일링 2.5 ATR
-    TIME_EXIT_DAYS = 15        # 15거래일 시간 청산
-    MAX_LOSS_PER_TRADE = 30_000   # 1건당 최대 손실 3만원
-    MAX_POSITION_PCT = 0.60    # 한 종목 자본의 60%
-    MAX_POSITIONS = 2          # 동시 보유 최대 2종목
-    DAILY_LOSS_LIMIT = 50_000  # 일일 손실 5만원
+    TRAILING_ATR_MULT = 3.0    # 트레일링 3.0 ATR
+    TIME_EXIT_DAYS = 30        # 30거래일 시간 청산
+    MAX_LOSS_PER_TRADE = 150_000  # 1건당 최대 손실 15만원 (자본의 1.5%)
+    MAX_POSITION_PCT = 0.30    # 한 종목 자본의 30%
+    MAX_POSITIONS = 4          # 동시 보유 최대 4종목
+    DAILY_LOSS_LIMIT = 300_000 # 일일 손실 30만원 (자본의 3%)
 
     def __init__(self, config: StrategyConfig = None):
         if config:

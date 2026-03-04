@@ -1,8 +1,13 @@
 """DB 데이터 조회 웹 UI"""
+import sys
+import os
 import sqlite3
 import json
 from pathlib import Path
 from flask import Flask, render_template_string, jsonify, request
+
+# auto 패키지 import를 위해 상위 디렉토리 추가
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 app = Flask(__name__)
 DB_PATH = Path(__file__).parent / "logs" / "market.db"
@@ -493,7 +498,7 @@ function renderTradeRows(trades) {
     const pnlText = t.pnl ? (t.pnl>0?'+':'')+Math.round(t.pnl).toLocaleString() : '-';
     return `<tr>
       <td>${t.timestamp}</td>
-      <td><strong>${t.ticker}</strong></td>
+      <td><strong>${t.name||t.ticker}</strong> <small style="color:#888">${t.ticker}</small></td>
       <td class="${sideClass}"><strong>${sideText}</strong></td>
       <td>${Math.round(t.price).toLocaleString()}</td>
       <td>${t.quantity}</td>
@@ -616,6 +621,10 @@ def api_trades():
     cols = ["id", "timestamp", "ticker", "side", "price", "quantity", "amount",
             "commission", "tax", "slippage", "pnl", "strategy", "memo"]
     trades = [dict(zip(cols, r)) for r in rows]
+    # 종목명 매핑
+    from auto.data.collector import UNIVERSE
+    for t in trades:
+        t["name"] = UNIVERSE.get(t["ticker"], t["ticker"])
     return jsonify({"trades": trades})
 
 

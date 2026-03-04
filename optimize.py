@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""전략 파라미터 최적화 (고속)
+"""전략 파라미터 최적화 (numpy 벡터화)
 
-1단계: 모든 종목의 일별 지표를 미리 계산 (1회)
-2단계: 파라미터별로 진입/청산 필터링만 반복 (빠름)
+1단계: 전종목 지표를 numpy 패널로 변환 (1회)
+2단계: 파라미터별 백테스트 반복 (패널 기반, ~0.3초/회)
 """
 import sys
 import os
@@ -15,331 +15,354 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import pandas as pd
-from auto.config import SystemConfig, FeeConfig
 from auto.data.collector import MarketDataCollector
 
 LOGS_DIR = Path(__file__).parent / "logs"
 
-# ─── 1단계: 지표 사전 계산 ─────────────────────────
 
+def build_panel(universe: dict[str, pd.DataFrame], market_df: pd.DataFrame) -> dict:
+    """전종목 일별 데이터를 numpy 배열로 변환"""
+    dates = market_df.index.sort_values()
+    date_to_idx = {d: i for i, d in enumerate(dates)}
+    n_dates = len(dates)
 
-def precompute_indicators(universe: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
-    """모든 종목에 대해 필요한 지표를 미리 계산"""
-    result = {}
-    for ticker, df in universe.items():
-        if len(df) < 60:
-            continue
-        d = df.copy()
-        d["ma5"] = d["close"].rolling(5).mean()
-        d["ma20"] = d["close"].rolling(20).mean()
-        d["vol_ma20"] = d["volume"].astype(float).rolling(20).mean()
-        d["vol_ratio"] = d["volume"].astype(float) / d["vol_ma20"]
+    tickers = [t for t in universe if t != "069500" and len(universe[t]) >= 60]
+    n_tickers = len(tickers)
 
-        # N일 고가 (당일 제외) - 여러 lookback 미리 계산
-        for lb in [10, 15, 20, 30, 40, 60]:
-            d[f"prev_high_{lb}"] = d["high"].shift(1).rolling(lb).max()
+    # 배열 초기화
+    close = np.full((n_dates, n_tickers), np.nan)
+    high = np.full((n_dates, n_tickers), np.nan)
+    low = np.full((n_dates, n_tickers), np.nan)
+    atr14 = np.full((n_dates, n_tickers), np.nan)
+    adx14 = np.full((n_dates, n_tickers), np.nan)
+    vol_ratio = np.full((n_dates, n_tickers), np.nan)
+    ma5 = np.full((n_dates, n_tickers), np.nan)
+    ma20 = np.full((n_dates, n_tickers), np.nan)
 
-        # ADX, ATR은 이미 DB에 있으면 사용
-        if "atr14" not in d.columns or d["atr14"].isna().all():
-            # ATR 계산
+    lookbacks = [10, 15, 20, 30, 40, 60]
+    prev_highs = {lb: np.full((n_dates, n_tickers), np.nan) for lb in lookbacks}
+
+    for j, ticker in enumerate(tickers):
+        df = universe[ticker].copy()
+
+        # 지표 계산
+        df["ma5"] = df["close"].rolling(5).mean()
+        df["ma20"] = df["close"].rolling(20).mean()
+        vol_ma = df["volume"].astype(float).rolling(20).mean()
+        df["vol_ratio"] = df["volume"].astype(float) / vol_ma
+
+        for lb in lookbacks:
+            df[f"ph_{lb}"] = df["high"].shift(1).rolling(lb).max()
+
+        if "atr14" not in df.columns or df["atr14"].isna().all():
             tr = pd.concat([
-                d["high"] - d["low"],
-                (d["high"] - d["close"].shift(1)).abs(),
-                (d["low"] - d["close"].shift(1)).abs()
+                df["high"] - df["low"],
+                (df["high"] - df["close"].shift(1)).abs(),
+                (df["low"] - df["close"].shift(1)).abs()
             ], axis=1).max(axis=1)
-            d["atr14"] = tr.ewm(span=14, adjust=False).mean()
+            df["atr14"] = tr.ewm(span=14, adjust=False).mean()
 
-        if "adx14" not in d.columns or d["adx14"].isna().all():
-            # ADX 계산
+        if "adx14" not in df.columns or df["adx14"].isna().all():
             tr = pd.concat([
-                d["high"] - d["low"],
-                (d["high"] - d["close"].shift(1)).abs(),
-                (d["low"] - d["close"].shift(1)).abs()
+                df["high"] - df["low"],
+                (df["high"] - df["close"].shift(1)).abs(),
+                (df["low"] - df["close"].shift(1)).abs()
             ], axis=1).max(axis=1)
-            atr14 = tr.ewm(span=14, adjust=False).mean()
-            up = d["high"] - d["high"].shift(1)
-            down = d["low"].shift(1) - d["low"]
-            plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0), index=d.index)
-            minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0), index=d.index)
-            plus_di = 100 * plus_dm.ewm(span=14, adjust=False).mean() / atr14
-            minus_di = 100 * minus_dm.ewm(span=14, adjust=False).mean() / atr14
+            a14 = tr.ewm(span=14, adjust=False).mean()
+            up = df["high"] - df["high"].shift(1)
+            down = df["low"].shift(1) - df["low"]
+            plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0), index=df.index)
+            minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0), index=df.index)
+            plus_di = 100 * plus_dm.ewm(span=14, adjust=False).mean() / a14
+            minus_di = 100 * minus_dm.ewm(span=14, adjust=False).mean() / a14
             dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-            d["adx14"] = dx.ewm(span=14, adjust=False).mean()
+            df["adx14"] = dx.ewm(span=14, adjust=False).mean()
 
-        result[ticker] = d
-    return result
+        # 패널에 매핑
+        for dt in df.index:
+            if dt not in date_to_idx:
+                continue
+            i = date_to_idx[dt]
+            close[i, j] = df.loc[dt, "close"]
+            high[i, j] = df.loc[dt, "high"]
+            low[i, j] = df.loc[dt, "low"]
+            atr14[i, j] = df.loc[dt, "atr14"]
+            adx14[i, j] = df.loc[dt, "adx14"]
+            vol_ratio[i, j] = df.loc[dt, "vol_ratio"]
+            ma5[i, j] = df.loc[dt, "ma5"]
+            ma20[i, j] = df.loc[dt, "ma20"]
+            for lb in lookbacks:
+                prev_highs[lb][i, j] = df.loc[dt, f"ph_{lb}"]
+
+    return {
+        "dates": dates, "tickers": tickers,
+        "close": close, "high": high, "low": low,
+        "atr14": atr14, "adx14": adx14, "vol_ratio": vol_ratio,
+        "ma5": ma5, "ma20": ma20, "prev_highs": prev_highs,
+        "n_dates": n_dates, "n_tickers": n_tickers,
+    }
 
 
-# ─── 2단계: 고속 백테스트 ──────────────────────────
-
-
-def fast_backtest(indicators: dict[str, pd.DataFrame],
-                  market_df: pd.DataFrame,
-                  params: dict) -> dict:
-    """지표 사전 계산 결과를 사용한 고속 백테스트"""
-
-    # 파라미터 추출
+def fast_backtest(panel: dict, params: dict) -> dict:
+    """numpy 패널 기반 고속 백테스트"""
     lookback = params["lookback"]
     adx_thresh = params["adx_threshold"]
     vol_mult = params["volume_mult"]
     stop_pct = params["stop_pct"]
     atr_stop_mult = params["atr_stop_mult"]
-    trail_atr_mult = params["trailing_atr_mult"]
+    trail_mult = params["trailing_atr_mult"]
     time_exit = params["time_exit_days"]
-    max_positions = params["max_positions"]
-    daily_loss_limit = params["daily_loss_limit"]
-    max_loss_per_trade = params["max_loss_per_trade"]
+    max_pos = params["max_positions"]
+    daily_limit = params["daily_loss_limit"]
+    max_loss_trade = params["max_loss_per_trade"]
     max_pos_pct = params["max_position_pct"]
 
-    # 수수료
-    buy_fee = 0.00015 + 0.001  # 수수료 + 슬리피지
-    sell_fee = 0.00015 + 0.0018 + 0.001  # 수수료 + 세금 + 슬리피지
+    buy_fee = 0.00115   # 수수료 + 슬리피지
+    sell_fee = 0.00295   # 수수료 + 세금 + 슬리피지
 
-    capital = 10_000_000
+    capital = 10_000_000.0
     cash = capital
-    peak = capital
-    max_dd = 0
+    peak_val = capital
 
-    # 포지션: {ticker: {entry_price, stop_loss, trailing_stop, highest, holding_days, qty, atr}}
-    positions = {}
-    trades = []
-    daily_values = []
+    cl = panel["close"]
+    hi = panel["high"]
+    lo = panel["low"]
+    at = panel["atr14"]
+    ad = panel["adx14"]
+    vr = panel["vol_ratio"]
+    m5 = panel["ma5"]
+    m20 = panel["ma20"]
+    ph = panel["prev_highs"].get(lookback)
 
-    dates = market_df.index.sort_values()
-    high_col = f"prev_high_{lookback}"
+    if ph is None:
+        return _empty_result(capital)
 
+    n_dates = panel["n_dates"]
+
+    # 포지션 추적 (최대 max_pos 개)
+    pos_ticker = np.full(max_pos, -1, dtype=np.int32)  # ticker index, -1 = 빈 슬롯
+    pos_entry = np.zeros(max_pos)
+    pos_stop = np.zeros(max_pos)
+    pos_trail = np.zeros(max_pos)
+    pos_highest = np.zeros(max_pos)
+    pos_days = np.zeros(max_pos, dtype=np.int32)
+    pos_qty = np.zeros(max_pos, dtype=np.int32)
+
+    sell_pnls = []
+    sell_reasons = []  # 0=손절 1=트레일 2=시간 3=일일손실
+    daily_returns = []
     prev_value = capital
+    max_dd = 0.0
 
-    for i in range(60, len(dates)):
-        date = dates[i]
-        date_str = date.strftime("%Y-%m-%d")
-
-        daily_pnl = 0
-
-        # 현재 가격 수집
-        current_data = {}
-        for ticker, df in indicators.items():
-            if date in df.index:
-                row = df.loc[date]
-                if pd.notna(row.get("adx14")) and pd.notna(row.get("atr14")):
-                    current_data[ticker] = row
+    for i in range(60, n_dates):
+        daily_pnl = 0.0
 
         # 포트폴리오 평가
-        pos_value = 0
-        for t, p in positions.items():
-            if t in current_data:
-                pos_value += current_data[t]["close"] * p["qty"]
-            else:
-                pos_value += p["entry_price"] * p["qty"]
-        total_value = cash + pos_value
+        pv = 0.0
+        for s in range(max_pos):
+            j = pos_ticker[s]
+            if j < 0:
+                continue
+            c = cl[i, j]
+            pv += (c if not np.isnan(c) else pos_entry[s]) * pos_qty[s]
+        total_value = cash + pv
 
-        # ── 청산 체크 ──
-        to_close = []
-        for ticker in list(positions.keys()):
-            pos = positions[ticker]
-            if ticker not in current_data:
+        # ── 청산 ──
+        for s in range(max_pos):
+            j = pos_ticker[s]
+            if j < 0:
                 continue
 
-            row = current_data[ticker]
-            cur_price = row["close"]
-            cur_high = row["high"]
-            cur_low = row["low"]
-            cur_atr = row["atr14"]
+            c = cl[i, j]
+            h = hi[i, j]
+            l = lo[i, j]
+            a = at[i, j]
 
-            pos["holding_days"] += 1
+            if np.isnan(c):
+                continue
 
-            # 고점 갱신 + 트레일링
-            if cur_high > pos["highest"]:
-                pos["highest"] = cur_high
-                new_trail = pos["highest"] - trail_atr_mult * cur_atr
-                if new_trail > pos["trailing_stop"]:
-                    pos["trailing_stop"] = new_trail
+            pos_days[s] += 1
 
-            # 저가 기반 손절 체크
-            if cur_low <= pos["stop_loss"]:
-                to_close.append((ticker, pos["stop_loss"], "손절"))
-            elif cur_low <= pos["trailing_stop"]:
-                to_close.append((ticker, pos["trailing_stop"], "트레일링스탑"))
-            elif pos["holding_days"] >= time_exit:
-                to_close.append((ticker, cur_price, "시간청산"))
+            # 고점/트레일링 갱신
+            if not np.isnan(h) and h > pos_highest[s]:
+                pos_highest[s] = h
+                if not np.isnan(a):
+                    nt = h - trail_mult * a
+                    if nt > pos_trail[s]:
+                        pos_trail[s] = nt
 
-        for ticker, exit_price, reason in to_close:
-            pos = positions.pop(ticker)
-            proceeds = exit_price * pos["qty"] * (1 - sell_fee)
-            cost = pos["entry_price"] * pos["qty"] * (1 + buy_fee)
-            pnl = proceeds - cost
-            cash += proceeds
-            daily_pnl += pnl
-            trades.append({
-                "timestamp": date_str, "ticker": ticker, "side": "sell",
-                "price": exit_price, "quantity": pos["qty"],
-                "pnl": pnl, "memo": reason,
-            })
+            reason = -1
+            exit_price = c
+            if not np.isnan(l):
+                if l <= pos_stop[s]:
+                    reason = 0
+                    exit_price = pos_stop[s]
+                elif l <= pos_trail[s]:
+                    reason = 1
+                    exit_price = pos_trail[s]
 
-        # 일일 손실 한도 체크 → 전체 청산
-        if daily_pnl <= -daily_loss_limit:
-            for ticker in list(positions.keys()):
-                pos = positions.pop(ticker)
-                if ticker in current_data:
-                    exit_price = current_data[ticker]["close"]
-                else:
-                    exit_price = pos["entry_price"]
-                proceeds = exit_price * pos["qty"] * (1 - sell_fee)
-                cost = pos["entry_price"] * pos["qty"] * (1 + buy_fee)
-                pnl = proceeds - cost
+            if reason < 0 and pos_days[s] >= time_exit:
+                reason = 2
+                exit_price = c
+
+            if reason >= 0:
+                proceeds = exit_price * pos_qty[s] * (1 - sell_fee)
+                cost_basis = pos_entry[s] * pos_qty[s] * (1 + buy_fee)
+                pnl = proceeds - cost_basis
                 cash += proceeds
                 daily_pnl += pnl
-                trades.append({
-                    "timestamp": date_str, "ticker": ticker, "side": "sell",
-                    "price": exit_price, "quantity": pos["qty"],
-                    "pnl": pnl, "memo": "일일손실한도",
-                })
+                sell_pnls.append(pnl)
+                sell_reasons.append(reason)
+                pos_ticker[s] = -1
 
-        # ── 진입 체크 ──
-        if len(positions) < max_positions and daily_pnl > -daily_loss_limit:
-            candidates = []
-            for ticker, row in current_data.items():
-                if ticker in positions:
+        # 일일 손실 한도
+        if daily_pnl <= -daily_limit:
+            for s in range(max_pos):
+                j = pos_ticker[s]
+                if j < 0:
                     continue
-                if ticker == "069500":  # 지수 ETF 제외
-                    continue
+                c = cl[i, j]
+                ep = c if not np.isnan(c) else pos_entry[s]
+                proceeds = ep * pos_qty[s] * (1 - sell_fee)
+                cost_basis = pos_entry[s] * pos_qty[s] * (1 + buy_fee)
+                pnl = proceeds - cost_basis
+                cash += proceeds
+                daily_pnl += pnl
+                sell_pnls.append(pnl)
+                sell_reasons.append(3)
+                pos_ticker[s] = -1
 
-                prev_high = row.get(high_col)
-                if pd.isna(prev_high):
-                    continue
+        # ── 진입 ──
+        n_held = int(np.sum(pos_ticker >= 0))
+        if n_held < max_pos and daily_pnl > -daily_limit:
+            # 벡터화 조건
+            hi_i = hi[i]
+            ph_i = ph[i]
+            ad_i = ad[i]
+            vr_i = vr[i]
+            m5_i = m5[i]
+            m20_i = m20[i]
+            cl_i = cl[i]
+            at_i = at[i]
 
-                cur_high_val = row["high"]
-                cur_adx = row["adx14"]
-                vol_ratio = row.get("vol_ratio", 0)
-                cur_ma5 = row.get("ma5", 0)
-                cur_ma20 = row.get("ma20", 0)
+            valid = ~np.isnan(cl_i) & ~np.isnan(at_i) & ~np.isnan(ph_i)
+            cond = valid & (hi_i > ph_i) & (ad_i > adx_thresh) & (vr_i > vol_mult) & (m5_i > m20_i)
 
-                if pd.isna(vol_ratio) or pd.isna(cur_ma5) or pd.isna(cur_ma20):
-                    continue
+            # 이미 보유 종목 제외
+            for s in range(max_pos):
+                if pos_ticker[s] >= 0:
+                    cond[pos_ticker[s]] = False
 
-                # 진입 조건
-                if (cur_high_val > prev_high and
-                    cur_adx > adx_thresh and
-                    vol_ratio > vol_mult and
-                    cur_ma5 > cur_ma20):
+            cand_idx = np.where(cond)[0]
+            if len(cand_idx) > 0:
+                strengths = np.clip((ad_i[cand_idx] - adx_thresh) / 30, 0, 1) * \
+                            np.clip(vr_i[cand_idx] / 3, 0, 1)
+                order = np.argsort(-strengths)
+                cand_idx = cand_idx[order]
 
-                    strength = min((cur_adx - adx_thresh) / 30, 1.0) * min(vol_ratio / 3, 1.0)
-                    candidates.append((ticker, row, strength))
+                for j in cand_idx:
+                    if n_held >= max_pos:
+                        break
 
-            # 강도순 정렬
-            candidates.sort(key=lambda x: x[2], reverse=True)
+                    cp = cl_i[j]
+                    ca = at_i[j]
 
-            for ticker, row, strength in candidates:
-                if len(positions) >= max_positions:
-                    break
+                    sl_pct = cp * (1 - stop_pct)
+                    sl_atr = cp - atr_stop_mult * ca
+                    sl = max(sl_pct, sl_atr)
 
-                cur_price = row["close"]
-                cur_atr = row["atr14"]
+                    risk = cp - sl
+                    if risk <= 0:
+                        continue
 
-                # 손절가
-                stop_by_pct = cur_price * (1 - stop_pct)
-                stop_by_atr = cur_price - atr_stop_mult * cur_atr
-                stop_loss = max(stop_by_pct, stop_by_atr)
+                    qr = int(max_loss_trade / risk)
+                    qw = int(total_value * max_pos_pct / cp)
+                    qc = int(cash / (cp * (1 + buy_fee)))
+                    qty = min(qr, qw, qc)
+                    if qty <= 0:
+                        continue
 
-                # 포지션 사이징
-                risk_per_share = cur_price - stop_loss
-                if risk_per_share <= 0:
-                    continue
+                    cost = cp * qty * (1 + buy_fee)
+                    if cost > cash:
+                        continue
 
-                qty_risk = int(max_loss_per_trade / risk_per_share)
-                qty_weight = int(total_value * max_pos_pct / cur_price)
-                qty_cash = int(cash / (cur_price * (1 + buy_fee)))
-                qty = min(qty_risk, qty_weight, qty_cash)
-                if qty <= 0:
-                    continue
+                    # 빈 슬롯 찾기
+                    slot = -1
+                    for s in range(max_pos):
+                        if pos_ticker[s] < 0:
+                            slot = s
+                            break
+                    if slot < 0:
+                        break
 
-                cost = cur_price * qty * (1 + buy_fee)
-                if cost > cash:
-                    continue
-
-                cash -= cost
-                trailing = cur_price - trail_atr_mult * cur_atr
-                positions[ticker] = {
-                    "entry_price": cur_price,
-                    "stop_loss": stop_loss,
-                    "trailing_stop": trailing,
-                    "highest": cur_price,
-                    "holding_days": 0,
-                    "qty": qty,
-                    "atr": cur_atr,
-                }
-                trades.append({
-                    "timestamp": date_str, "ticker": ticker, "side": "buy",
-                    "price": cur_price, "quantity": qty,
-                    "pnl": 0, "memo": f"ADX={cur_adx:.0f} VOL={vol_ratio:.1f}x",
-                })
+                    cash -= cost
+                    pos_ticker[slot] = j
+                    pos_entry[slot] = cp
+                    pos_stop[slot] = sl
+                    pos_trail[slot] = cp - trail_mult * ca
+                    pos_highest[slot] = cp
+                    pos_days[slot] = 0
+                    pos_qty[slot] = qty
+                    n_held += 1
 
         # 일일 스냅샷
-        pos_value = sum(
-            current_data.get(t, {}).get("close", p["entry_price"]) * p["qty"]
-            if isinstance(current_data.get(t), pd.Series) else p["entry_price"] * p["qty"]
-            for t, p in positions.items()
-        )
-        # 더 안전한 평가
-        pos_value = 0
-        for t, p in positions.items():
-            if t in current_data:
-                pos_value += current_data[t]["close"] * p["qty"]
-            else:
-                pos_value += p["entry_price"] * p["qty"]
+        pv = 0.0
+        for s in range(max_pos):
+            j = pos_ticker[s]
+            if j < 0:
+                continue
+            c = cl[i, j]
+            pv += (c if not np.isnan(c) else pos_entry[s]) * pos_qty[s]
+        tv = cash + pv
+        dr = (tv - prev_value) / prev_value if prev_value > 0 else 0
+        daily_returns.append(dr)
 
-        total_value = cash + pos_value
-        daily_return = (total_value - prev_value) / prev_value if prev_value > 0 else 0
-
-        peak = max(peak, total_value)
-        dd = (peak - total_value) / peak if peak > 0 else 0
+        peak_val = max(peak_val, tv)
+        dd = (peak_val - tv) / peak_val if peak_val > 0 else 0
         max_dd = max(max_dd, dd)
+        prev_value = tv
 
-        daily_values.append({
-            "date": date_str,
-            "total_value": total_value,
-            "daily_return": daily_return,
-        })
-        prev_value = total_value
+    # 결과 집계
+    n_sells = len(sell_pnls)
+    if n_sells == 0:
+        return _empty_result(prev_value, max_dd)
 
-    # 결과 계산
-    sells = [t for t in trades if t["side"] == "sell"]
-    wins = sum(1 for t in sells if t["pnl"] > 0)
-    win_rate = (wins / len(sells) * 100) if sells else 0
+    pnl_arr = np.array(sell_pnls)
+    wins = int(np.sum(pnl_arr > 0))
+    gp = float(np.sum(pnl_arr[pnl_arr > 0]))
+    gl = float(np.abs(np.sum(pnl_arr[pnl_arr < 0])))
 
-    gross_profit = sum(t["pnl"] for t in sells if t["pnl"] > 0)
-    gross_loss = abs(sum(t["pnl"] for t in sells if t["pnl"] < 0))
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0)
+    ret_arr = np.array(daily_returns)
+    std = ret_arr.std()
+    sharpe = float(ret_arr.mean() / std * (252**0.5)) if std > 0 else 0
 
-    avg_pnl = (sum(t["pnl"] for t in sells) / len(sells)) if sells else 0
-
-    returns = pd.Series([d["daily_return"] for d in daily_values])
-    sharpe = (returns.mean() / returns.std() * (252**0.5)) if returns.std() > 0 else 0
-
-    final_value = daily_values[-1]["total_value"] if daily_values else capital
-    total_return = (final_value - capital) / capital * 100
-
-    # 청산 사유 분포
+    reason_map = {0: "손절", 1: "트레일링", 2: "시간청산", 3: "일일손실"}
     exit_reasons = {}
-    for t in sells:
-        r = t.get("memo", "기타")
-        exit_reasons[r] = exit_reasons.get(r, 0) + 1
+    for rc in sell_reasons:
+        name = reason_map.get(rc, "기타")
+        exit_reasons[name] = exit_reasons.get(name, 0) + 1
 
     return {
-        "total_return": total_return,
+        "total_return": (prev_value - 10_000_000) / 10_000_000 * 100,
         "max_drawdown": max_dd * 100,
         "sharpe": sharpe,
-        "win_rate": win_rate,
-        "profit_factor": profit_factor,
-        "trade_count": len(sells),
-        "avg_pnl": avg_pnl,
-        "final_value": final_value,
+        "win_rate": wins / n_sells * 100,
+        "profit_factor": gp / gl if gl > 0 else (float("inf") if gp > 0 else 0),
+        "trade_count": n_sells,
+        "avg_pnl": float(pnl_arr.mean()),
+        "final_value": prev_value,
         "exit_reasons": exit_reasons,
     }
 
 
+def _empty_result(final=10_000_000, max_dd=0):
+    return {"total_return": (final - 10_000_000) / 10_000_000 * 100,
+            "max_drawdown": max_dd * 100, "sharpe": 0, "win_rate": 0,
+            "profit_factor": 0, "trade_count": 0, "avg_pnl": 0,
+            "final_value": final, "exit_reasons": {}}
+
+
 def optimize():
-    # 데이터 로드
     collector = MarketDataCollector(str(LOGS_DIR / "market.db"))
     start, end = "20210303", "20260303"
 
@@ -348,27 +371,26 @@ def optimize():
     universe_raw = collector.load_all_from_db(start, end)
     print(f"  마켓: {len(market_df)}일, 유니버스: {len(universe_raw)}종목")
 
-    print("지표 사전 계산...")
+    print("numpy 패널 구축...")
     t0 = time.time()
-    indicators = precompute_indicators(universe_raw)
-    print(f"  완료: {time.time()-t0:.1f}초, {len(indicators)}종목\n")
+    panel = build_panel(universe_raw, market_df)
+    print(f"  완료: {time.time()-t0:.1f}초, {panel['n_tickers']}종목 × {panel['n_dates']}일\n")
 
-    # 단일 벤치마크
-    print("벤치마크 (현재 파라미터)...")
-    current_params = {
+    # 벤치마크
+    current = {
         "lookback": 40, "adx_threshold": 20, "volume_mult": 2.0,
         "stop_pct": 0.05, "atr_stop_mult": 3.0, "trailing_atr_mult": 2.5,
         "time_exit_days": 15, "max_positions": 2, "daily_loss_limit": 50_000,
         "max_loss_per_trade": 30_000, "max_position_pct": 0.60,
     }
     t0 = time.time()
-    bench = fast_backtest(indicators, market_df, current_params)
-    bench_time = time.time() - t0
-    print(f"  1회 소요: {bench_time:.2f}초")
+    bench = fast_backtest(panel, current)
+    bt = time.time() - t0
+    print(f"벤치마크: {bt:.2f}초/회")
     print(f"  현재: ret={bench['total_return']:+.1f}% dd={bench['max_drawdown']:.1f}% "
           f"sharpe={bench['sharpe']:.2f} wr={bench['win_rate']:.0f}% trades={bench['trade_count']}\n")
 
-    # ─── 파라미터 그리드 ────────────────────────────
+    # ─── 그리드 ────────────────────────────
     grid = {
         "lookback":          [10, 15, 20, 30, 40, 60],
         "adx_threshold":     [15, 20, 25, 30],
@@ -378,22 +400,15 @@ def optimize():
         "trailing_atr_mult": [1.5, 2.0, 2.5, 3.0],
         "time_exit_days":    [7, 10, 15, 20, 30],
     }
-
     fixed = {
-        "max_positions": 3,
-        "daily_loss_limit": 50_000,
-        "max_loss_per_trade": 30_000,
-        "max_position_pct": 0.30,
+        "max_positions": 3, "daily_loss_limit": 50_000,
+        "max_loss_per_trade": 30_000, "max_position_pct": 0.30,
     }
 
     keys = list(grid.keys())
-    values = list(grid.values())
-    combos = list(itertools.product(*values))
+    combos = list(itertools.product(*grid.values()))
     total = len(combos)
-    est_time = total * bench_time
-    print(f"=== 그리드 서치 ===")
-    print(f"조합: {total}개, 예상 소요: {est_time/60:.0f}분")
-    print(f"파라미터: {', '.join(keys)}\n")
+    print(f"=== 1차 그리드 서치: {total}개 조합, 예상 {total*bt/60:.0f}분 ===\n")
 
     results = []
     t_start = time.time()
@@ -401,110 +416,70 @@ def optimize():
     for idx, combo in enumerate(combos):
         params = dict(zip(keys, combo))
         params.update(fixed)
-
         try:
-            r = fast_backtest(indicators, market_df, params)
+            r = fast_backtest(panel, params)
             r["params"] = params
             results.append(r)
-        except Exception as e:
+        except Exception:
             pass
 
-        if (idx + 1) % 500 == 0:
-            elapsed = time.time() - t_start
-            eta = elapsed / (idx + 1) * (total - idx - 1)
-            best_so_far = max(results, key=lambda x: x["sharpe"]) if results else None
-            best_str = f"best sharpe={best_so_far['sharpe']:.2f} ret={best_so_far['total_return']:+.1f}%" if best_so_far else ""
-            print(f"  [{idx+1}/{total}] {elapsed:.0f}초 경과, ETA {eta:.0f}초 | {best_str}")
+        if (idx + 1) % 1000 == 0:
+            el = time.time() - t_start
+            eta = el / (idx+1) * (total - idx - 1)
+            best = max(results, key=lambda x: x["sharpe"]) if results else None
+            bs = f"best sharpe={best['sharpe']:.2f} ret={best['total_return']:+.1f}%" if best else ""
+            print(f"  [{idx+1}/{total}] {el:.0f}s, ETA {eta:.0f}s | {bs}")
 
     elapsed = time.time() - t_start
-    print(f"\n완료: {elapsed:.0f}초 ({elapsed/60:.1f}분)")
+    print(f"\n1차 완료: {elapsed:.0f}초 ({elapsed/60:.1f}분)")
 
-    if not results:
-        print("결과 없음")
-        return
-
-    # ─── 결과 정렬 ──────────────────────────────────
-    # 필터: 거래 10회 이상
     results = [r for r in results if r["trade_count"] >= 10]
     results.sort(key=lambda r: r["sharpe"], reverse=True)
 
     print(f"\n{'='*110}")
-    print(f"=== 상위 30개 (샤프비율 기준, 거래 10회+) ===")
+    print(f"=== 상위 30개 (샤프비율 기준) ===")
     print(f"{'='*110}")
-    print(f"{'#':>3} {'수익률':>8} {'MDD':>7} {'샤프':>6} {'승률':>5} {'PF':>5} "
-          f"{'거래':>4} {'평균PnL':>10} | {'LB':>3} {'ADX':>3} {'VOL':>4} "
-          f"{'STOP':>5} {'ATR_S':>5} {'TRAIL':>5} {'TIME':>4}")
+    hdr = (f"{'#':>3} {'수익률':>8} {'MDD':>7} {'샤프':>6} {'승률':>5} {'PF':>5} "
+           f"{'거래':>4} {'평균PnL':>10} | {'LB':>3} {'ADX':>3} {'VOL':>4} "
+           f"{'STOP':>5} {'ATR_S':>5} {'TRAIL':>5} {'TIME':>4}")
+    print(hdr)
     print("-" * 110)
 
     for i, r in enumerate(results[:30]):
         p = r["params"]
         pf = r["profit_factor"]
-        pf_str = f"{pf:.2f}" if pf != float("inf") else " inf"
+        pf_s = f"{pf:.2f}" if pf != float("inf") else " inf"
         print(f"{i+1:>3} {r['total_return']:>+7.1f}% {r['max_drawdown']:>6.1f}% "
-              f"{r['sharpe']:>6.2f} {r['win_rate']:>4.0f}% {pf_str:>5} "
+              f"{r['sharpe']:>6.2f} {r['win_rate']:>4.0f}% {pf_s:>5} "
               f"{r['trade_count']:>4} {r['avg_pnl']:>+9,.0f} | "
               f"{p['lookback']:>3} {p['adx_threshold']:>3} {p['volume_mult']:>4.1f} "
               f"{p['stop_pct']:>5.2f} {p['atr_stop_mult']:>5.1f} "
               f"{p['trailing_atr_mult']:>5.1f} {p['time_exit_days']:>4}")
 
-    # 최적 파라미터
     best = results[0]
-    print(f"\n{'='*110}")
-    print(f"=== 최적 파라미터 ===")
     bp = best["params"]
-    print(f"  lookback:          {bp['lookback']}일")
-    print(f"  adx_threshold:     {bp['adx_threshold']}")
-    print(f"  volume_mult:       {bp['volume_mult']}배")
-    print(f"  stop_pct:          {bp['stop_pct']*100:.0f}%")
-    print(f"  atr_stop_mult:     {bp['atr_stop_mult']}")
-    print(f"  trailing_atr_mult: {bp['trailing_atr_mult']}")
-    print(f"  time_exit_days:    {bp['time_exit_days']}일")
-    print(f"\n  수익률: {best['total_return']:+.2f}%")
-    print(f"  최대 DD: {best['max_drawdown']:.2f}%")
-    print(f"  샤프: {best['sharpe']:.2f}")
-    print(f"  승률: {best['win_rate']:.1f}%")
-    print(f"  손익비: {best['profit_factor']:.2f}")
-    print(f"  거래: {best['trade_count']}회")
-    print(f"  청산 사유: {best['exit_reasons']}")
+    print(f"\n=== 1차 최적 ===")
+    for k, v in bp.items():
+        if k in grid:
+            print(f"  {k}: {v}")
+    print(f"  ret={best['total_return']:+.2f}% dd={best['max_drawdown']:.2f}% "
+          f"sharpe={best['sharpe']:.2f} wr={best['win_rate']:.1f}% pf={best['profit_factor']:.2f}")
+    print(f"  청산: {best['exit_reasons']}")
 
-    # 결과 저장
-    rows = []
-    for r in results:
-        row = {**r["params"]}
-        for k in ["total_return", "max_drawdown", "sharpe", "win_rate",
-                   "profit_factor", "trade_count", "avg_pnl", "final_value"]:
-            row[k] = r[k]
-        rows.append(row)
-    pd.DataFrame(rows).to_csv(LOGS_DIR / "optimization_results.csv", index=False)
-
-    best_save = {"params": best["params"], "results": {k: v for k, v in best.items() if k != "params"}}
-    best_save["results"]["exit_reasons"] = str(best["exit_reasons"])
-    with open(LOGS_DIR / "best_params.json", "w") as f:
-        json.dump(best_save, f, ensure_ascii=False, indent=2, default=str)
-
-    print(f"\n저장: optimization_results.csv, best_params.json")
-
-    # ─── 고정 파라미터도 탐색 ──────────────────────
-    print(f"\n{'='*110}")
-    print(f"=== 2차: 고정 파라미터 탐색 (상위 5개 × 포지션/비중) ===")
-
+    # ─── 2차: 포지션/비중 ──────────────────
+    print(f"\n=== 2차: 상위 5개 × 포지션/비중 ===")
     top5 = results[:5]
-    fixed_grid = {
-        "max_positions":    [2, 3, 4, 5],
-        "max_position_pct": [0.15, 0.20, 0.30, 0.40],
-    }
-    fixed_combos = list(itertools.product(*fixed_grid.values()))
-
     results2 = []
     for base in top5:
-        for mp, mpp in fixed_combos:
-            params = {**base["params"], "max_positions": mp, "max_position_pct": mpp}
-            try:
-                r = fast_backtest(indicators, market_df, params)
-                r["params"] = params
-                results2.append(r)
-            except Exception:
-                pass
+        for mp in [2, 3, 4, 5]:
+            for mpp in [0.15, 0.20, 0.30, 0.40, 0.60]:
+                params = {**base["params"], "max_positions": mp, "max_position_pct": mpp}
+                try:
+                    r = fast_backtest(panel, params)
+                    r["params"] = params
+                    results2.append(r)
+                except Exception:
+                    pass
 
     results2 = [r for r in results2 if r["trade_count"] >= 10]
     results2.sort(key=lambda r: r["sharpe"], reverse=True)
@@ -516,22 +491,33 @@ def optimize():
 
     for i, r in enumerate(results2[:15]):
         p = r["params"]
-        pf_str = f"{r['profit_factor']:.2f}" if r["profit_factor"] != float("inf") else " inf"
+        pf_s = f"{r['profit_factor']:.2f}" if r["profit_factor"] != float("inf") else " inf"
         print(f"{i+1:>3} {r['total_return']:>+7.1f}% {r['max_drawdown']:>6.1f}% "
-              f"{r['sharpe']:>6.2f} {r['win_rate']:>4.0f}% {pf_str:>5} "
+              f"{r['sharpe']:>6.2f} {r['win_rate']:>4.0f}% {pf_s:>5} "
               f"{r['trade_count']:>4} | "
               f"{p['lookback']:>3} {p['adx_threshold']:>3} {p['volume_mult']:>4.1f} "
               f"{p['stop_pct']:>5.2f} {p['trailing_atr_mult']:>5.1f} "
               f"{p['time_exit_days']:>4} {p['max_positions']:>3} {p['max_position_pct']*100:>3.0f}%")
 
-    if results2:
-        final_best = results2[0]
-        final_save = {"params": final_best["params"],
-                      "results": {k: v for k, v in final_best.items() if k != "params"}}
-        final_save["results"]["exit_reasons"] = str(final_best.get("exit_reasons", {}))
-        with open(LOGS_DIR / "best_params.json", "w") as f:
-            json.dump(final_save, f, ensure_ascii=False, indent=2, default=str)
-        print(f"\n최종 최적 파라미터 저장: best_params.json")
+    # 저장
+    rows = []
+    all_results = results + results2
+    for r in all_results:
+        row = {**r["params"]}
+        for k in ["total_return", "max_drawdown", "sharpe", "win_rate",
+                   "profit_factor", "trade_count", "avg_pnl", "final_value"]:
+            row[k] = r[k]
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(LOGS_DIR / "optimization_results.csv", index=False)
+
+    final_best = results2[0] if results2 else results[0]
+    with open(LOGS_DIR / "best_params.json", "w") as f:
+        save = {"params": final_best["params"],
+                "results": {k: v for k, v in final_best.items() if k not in ("params",)}}
+        save["results"]["exit_reasons"] = str(final_best.get("exit_reasons", {}))
+        json.dump(save, f, ensure_ascii=False, indent=2, default=str)
+
+    print(f"\n저장 완료: optimization_results.csv, best_params.json")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from ..data.collector import UNIVERSE
+
 logger = logging.getLogger(__name__)
 
 STATE_FILE = Path(__file__).parent.parent / "logs" / "trading_state.json"
@@ -77,6 +79,7 @@ class TelegramBot:
             "*사용 가능한 명령어*\n\n"
             "/status - 포트폴리오 현황\n"
             "/positions - 보유 종목 상세\n"
+            "/trades - 당일 거래 내역\n"
             "/screening - 스크리닝 결과\n"
             "/price 종목코드 - 실시간 시세\n"
             "/update - 최신 주가 데이터 갱신\n"
@@ -89,16 +92,34 @@ class TelegramBot:
             self._send("상태 파일을 읽을 수 없습니다.")
             return
 
-        capital = state.get("capital", 0)
+        capital = state.get("capital", 10_000_000)
         cash = state.get("cash", 0)
         positions = state.get("positions", {})
-        daily_pnl = state.get("daily_pnl", 0)
 
-        # 보유 종목 평가금액 합산
-        pos_value = sum(p.get("current_value", p.get("entry_price", 0) * p.get("quantity", 0))
-                        for p in positions.values())
+        # 당일 실현 손익 (daily_trades에서 계산)
+        daily_trades = state.get("daily_trades", [])
+        daily_pnl = sum(t.get("pnl", 0) for t in daily_trades if t.get("side") == "sell")
+
+        # 보유 종목 실시간 평가금액
+        pos_value = 0
+        if positions:
+            collector = self._get_collector()
+            live = collector.fetch_live_prices(list(positions.keys()))
+            for ticker, p in positions.items():
+                qty = p.get("qty", 0)
+                cur = live.get(ticker, {}).get("close", 0)
+                if cur:
+                    pos_value += cur * qty
+                else:
+                    pos_value += p.get("entry_price", 0) * qty
+
         total = cash + pos_value
         ret_pct = (total - capital) / capital * 100 if capital else 0
+
+        # 당일 거래 요약
+        buys = [t for t in daily_trades if t["side"] == "buy"]
+        sells = [t for t in daily_trades if t["side"] == "sell"]
+        trade_summary = f"당일 거래: 매수 {len(buys)}건, 매도 {len(sells)}건"
 
         self._send(
             f"*포트폴리오 현황*\n\n"
@@ -107,7 +128,8 @@ class TelegramBot:
             f"보유 평가: {pos_value:,.0f}원\n"
             f"보유 종목: {len(positions)}개\n"
             f"누적 수익률: {ret_pct:+.2f}%\n"
-            f"당일 손익: {daily_pnl:+,.0f}원"
+            f"당일 손익: {daily_pnl:+,.0f}원\n"
+            f"{trade_summary}"
         )
 
     def cmd_positions(self, _args: str):
@@ -125,12 +147,14 @@ class TelegramBot:
 
         lines = ["*보유 종목 상세*\n"]
         for ticker, pos in positions.items():
-            name = pos.get("name", ticker)
+            name = UNIVERSE.get(ticker, ticker)
             entry = pos.get("entry_price", 0)
-            qty = pos.get("quantity", 0)
+            qty = pos.get("qty", 0)
             stop = pos.get("stop_loss", 0)
             days = pos.get("holding_days", 0)
             trail = pos.get("trailing_stop", 0)
+            highest = pos.get("highest", 0)
+            entry_date = pos.get("entry_date", "")
 
             cur = live.get(ticker, {}).get("close", 0)
             if cur:
@@ -141,10 +165,10 @@ class TelegramBot:
 
             lines.append(
                 f"*{name}* ({ticker})\n"
-                f"  진입: {entry:,.0f}원 × {qty}주\n"
+                f"  진입: {entry:,.0f}원 × {qty}주 ({entry_date})\n"
                 f"  현재: {price_str}\n"
                 f"  손절: {stop:,.0f} / 트레일링: {trail:,.0f}\n"
-                f"  보유: {days}일"
+                f"  고점: {highest:,.0f} / 보유: {days}일"
             )
 
         self._send("\n\n".join(lines))
@@ -176,14 +200,43 @@ class TelegramBot:
 
         self._send("\n\n".join(lines))
 
+    def cmd_trades(self, _args: str):
+        state = _load_state()
+        daily_trades = state.get("daily_trades", [])
+
+        if not daily_trades:
+            self._send("당일 거래 내역이 없습니다.")
+            return
+
+        lines = ["*당일 거래 내역*\n"]
+        total_pnl = 0
+        for t in daily_trades:
+            side = "매수" if t["side"] == "buy" else "매도"
+            name = UNIVERSE.get(t["ticker"], t["ticker"])
+            price = t.get("price", 0)
+            qty = t.get("quantity", 0)
+            pnl = t.get("pnl", 0)
+            memo = t.get("memo", "")
+
+            line = f"  {side} *{name}* {price:,.0f}원 × {qty}주"
+            if t["side"] == "sell":
+                line += f"\n  손익: {pnl:+,.0f}원"
+                total_pnl += pnl
+            if memo:
+                line += f"\n  사유: {memo[:50]}"
+            lines.append(line)
+
+        if any(t["side"] == "sell" for t in daily_trades):
+            lines.append(f"\n*당일 실현손익: {total_pnl:+,.0f}원*")
+
+        self._send("\n\n".join(lines))
+
     def cmd_price(self, args: str):
         ticker = args.strip()
         if not ticker:
             self._send("사용법: /price 종목코드\n예: /price 005930")
             return
 
-        # 종목명 조회
-        from ..data.collector import UNIVERSE
         name = UNIVERSE.get(ticker, "")
 
         collector = self._get_collector()
@@ -236,6 +289,7 @@ class TelegramBot:
         "/start": "cmd_help",
         "/status": "cmd_status",
         "/positions": "cmd_positions",
+        "/trades": "cmd_trades",
         "/screening": "cmd_screening",
         "/price": "cmd_price",
         "/update": "cmd_update",

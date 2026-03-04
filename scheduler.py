@@ -297,7 +297,7 @@ def job_start_monitoring():
 
         # 일일 손실 체크
         daily_pnl = sum(t.get("pnl", 0) for t in state.get("daily_trades", []))
-        if daily_pnl <= -50_000:
+        if daily_pnl <= -strategy.DAILY_LOSS_LIMIT:
             logger.warning(f"일일 손실 한도 도달: {daily_pnl:+,.0f}원 → 매수 중단")
             alert.send(f"*⚠️ 일일 손실 한도 도달*\n실현손익: {daily_pnl:+,.0f}원\n신규 매수 중단")
         else:
@@ -306,7 +306,7 @@ def job_start_monitoring():
             n_positions = len(positions)
 
             for cand in candidates:
-                if n_positions >= 2:
+                if n_positions >= strategy.MAX_POSITIONS:
                     break
                 if cand["ticker"] in positions:
                     continue
@@ -501,7 +501,7 @@ def job_intraday_monitor():
         if sold_any:
             # 일일 손실 체크
             daily_pnl = sum(t.get("pnl", 0) for t in state.get("daily_trades", []))
-            if daily_pnl <= -50_000:
+            if daily_pnl <= -strategy.DAILY_LOSS_LIMIT:
                 # 나머지 포지션도 전체 청산
                 for ticker in list(positions.keys()):
                     if ticker not in live_prices:
@@ -527,6 +527,98 @@ def job_intraday_monitor():
                         cash += result.filled_price * qty - result.total_cost
                         del positions[ticker]
                 alert.send(f"*⚠️ 일일 손실 한도 초과*\n실현손익: {daily_pnl:+,.0f}원\n전체 포지션 청산")
+
+        # ─── 장중 신규 매수 스크리닝 (여유 슬롯이 있을 때) ───
+        daily_pnl = sum(t.get("pnl", 0) for t in state.get("daily_trades", []))
+        n_positions = len(positions)
+
+        if (n_positions < strategy.MAX_POSITIONS
+                and daily_pnl > -strategy.DAILY_LOSS_LIMIT
+                and now.hour < 15):  # 15시 이후는 신규 매수 안 함
+
+            start_date = (now - timedelta(days=120)).strftime("%Y%m%d")
+            today = now.strftime("%Y%m%d")
+            today_dash = now.strftime("%Y-%m-%d")
+
+            for ticker, name in UNIVERSE.items():
+                if n_positions >= strategy.MAX_POSITIONS:
+                    break
+                if ticker == "069500" or ticker in positions:
+                    continue
+
+                df = collector.load_from_db(ticker, start_date, today)
+                if df.empty or len(df) < 60:
+                    continue
+
+                # 장중 실시간 가격으로 당일 봉 업데이트
+                lp = collector.fetch_live_prices([ticker]).get(ticker)
+                if not lp:
+                    continue
+
+                # 당일 실시간 데이터를 마지막 행에 반영
+                last_date = df.index[-1]
+                today_dt = pd.Timestamp(now.strftime("%Y-%m-%d"))
+                if last_date < today_dt:
+                    # 오늘 데이터가 DB에 없으면 실시간으로 추가
+                    new_row = pd.DataFrame({
+                        "open": [lp["open"]], "high": [lp["high"]],
+                        "low": [lp["low"]], "close": [lp["close"]],
+                        "volume": [lp["volume"]],
+                    }, index=[today_dt])
+                    df = pd.concat([df, new_row])
+
+                sig = strategy.generate_signal(df, ticker)
+                if not sig:
+                    continue
+
+                breakout = sig.breakout_level
+                stop_by_pct = breakout * (1 - strategy.STOP_PCT)
+                stop_by_atr = breakout - strategy.ATR_STOP_MULT * (df.iloc[-1].get("atr14", 0) or 0)
+                stop_loss = max(stop_by_pct, stop_by_atr)
+
+                price = lp["close"]
+                qty = strategy.calculate_position_size(price, stop_loss, capital, cash)
+                if qty <= 0:
+                    continue
+
+                order = Order(ticker, OrderSide.BUY, price, qty, "momentum", sig.reason)
+                engine.set_current_prices({ticker: price})
+                result = engine.execute_order(order)
+
+                if result.success:
+                    cost = result.filled_price * qty + result.total_cost
+                    if cost > cash:
+                        continue
+
+                    positions[ticker] = {
+                        "qty": qty, "entry_price": result.filled_price,
+                        "entry_date": now.strftime("%Y-%m-%d"),
+                        "stop_loss": stop_loss, "atr": df.iloc[-1].get("atr14", 0) or 0,
+                        "holding_days": 0, "highest": result.filled_price,
+                        "trailing_stop": stop_loss,
+                    }
+                    cash -= cost
+                    n_positions += 1
+
+                    trade = {
+                        "timestamp": now.strftime("%Y-%m-%d"), "ticker": ticker,
+                        "side": "buy", "price": result.filled_price, "quantity": qty,
+                        "amount": result.filled_price * qty,
+                        "commission": result.commission, "tax": result.tax,
+                        "slippage": result.slippage, "pnl": 0,
+                        "strategy": "momentum", "memo": f"장중스크리닝: {sig.reason}",
+                    }
+                    store.save_trade(trade)
+                    state["daily_trades"].append(trade)
+
+                    alert.send(
+                        f"*🔔 장중 매수*\n"
+                        f"종목: {name} ({ticker})\n"
+                        f"체결: {result.filled_price:,.0f}원 × {qty}주\n"
+                        f"손절: {stop_loss:,.0f}원\n"
+                        f"사유: {sig.reason[:60]}"
+                    )
+                    logger.info(f"[장중매수] {name}({ticker}) {qty}주 @ {result.filled_price:,.0f}")
 
         # 상태 저장
         state["cash"] = cash
@@ -741,8 +833,7 @@ def job_daily_settlement():
             "drawdown": drawdown,
         })
 
-        # 자본 갱신
-        state["capital"] = total_value
+        # 자본은 초기 투입금이므로 변경하지 않음 (누적 수익률 계산용)
         _save_state(state)
 
         # 텔레그램 일일 리포트
