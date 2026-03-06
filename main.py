@@ -1,7 +1,6 @@
 """메인 실행 - 백테스트 및 페이퍼 트레이딩"""
-import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from .config import SystemConfig
 from .data.collector import MarketDataCollector

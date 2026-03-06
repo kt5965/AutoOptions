@@ -1189,5 +1189,10 @@ def main():
         logger.info("스케줄러 종료")
 
 
+def run_scheduler():
+    """스케줄러 실행 (Windows 서비스용)"""
+    main()
+
+
 if __name__ == "__main__":
     main()
